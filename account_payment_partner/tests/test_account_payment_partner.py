@@ -129,6 +129,7 @@ class TestAccountPaymentPartner(BaseCommon):
             {
                 "acc_number": "5345345",
                 "partner_id": cls.supplier.id,
+                "allow_out_payment": True,
             }
         )
         cls.supplier.with_company(
@@ -177,7 +178,7 @@ class TestAccountPaymentPartner(BaseCommon):
                 "bank_account_id": cls.journal_bank.id,
             }
         )
-        cls.supplier_invoice = cls.move_model.create(
+        cls.supplier_invoice = cls.move_model.with_company(cls.company.id).create(
             {
                 "partner_id": cls.supplier.id,
                 "invoice_date": fields.Date.today(),
@@ -228,6 +229,7 @@ class TestAccountPaymentPartner(BaseCommon):
 
     def test_partner_id_changes_compute_partner_bank(self):
         # Test _compute_partner_bank is executed when partner_id changes
+        self.env.company.keep_partner_bank_without_payment_mode = False
         move_form = Form(
             self.env["account.move"].with_context(default_move_type="out_invoice")
         )
@@ -250,6 +252,7 @@ class TestAccountPaymentPartner(BaseCommon):
         invoice.company_id = self.company_2
         self.assertEqual(invoice.payment_mode_id, self.payment_mode_model)
 
+        self.company_2.keep_partner_bank_without_payment_mode = False
         invoice.payment_mode_id = False
         self.assertFalse(invoice.partner_bank_id)
 
@@ -427,7 +430,8 @@ class TestAccountPaymentPartner(BaseCommon):
             refund_invoice.payment_mode_id,
             invoice.payment_mode_id.refund_payment_mode_id,
         )
-        self.assertEqual(refund_invoice.partner_bank_id, invoice.partner_bank_id)
+        # Now the partner_bank_id can be a not allow_out_payment bank account
+        self.assertTrue(refund_invoice.partner_bank_id)
 
     def test_invoice_out_refund(self):
         invoice = self._create_invoice(
@@ -497,6 +501,7 @@ class TestAccountPaymentPartner(BaseCommon):
         vals = {"partner_id": False, "move_type": "in_invoice"}
         invoice = self.move_model.new(vals)
         self.assertFalse(invoice.partner_bank_id)
+        self.env.company.keep_partner_bank_without_payment_mode = False
         vals = {"partner_id": False, "move_type": "in_refund"}
         invoice = self.move_model.new(vals)
         self.assertFalse(invoice.partner_bank_id)
@@ -509,8 +514,60 @@ class TestAccountPaymentPartner(BaseCommon):
         self.assertEqual(self.supplier_invoice.partner_bank_id, self.supplier_bank)
         mode.payment_method_id.bank_account_required = False
         self.assertEqual(self.supplier_invoice.partner_bank_id, self.supplier_bank)
+        self.env.company.keep_partner_bank_without_payment_mode = True
+        self.supplier_invoice.payment_mode_id = False
+        self.assertEqual(self.supplier_invoice.partner_bank_id, self.supplier_bank)
+
+    def test_no_payment_mode_clears_bank_when_flag_disabled(self):
+        """When keep_partner_bank_without_payment_mode is disabled,
+        clearing the payment mode should also clear partner_bank_id."""
+        self.company.keep_partner_bank_without_payment_mode = False
+        self.supplier_invoice.partner_bank_id = self.supplier_bank.id
         self.supplier_invoice.payment_mode_id = False
         self.assertFalse(self.supplier_invoice.partner_bank_id)
+
+    def test_refund_no_payment_mode_preserves_partner_bank(self):
+        """Test that partner_bank_id is preserved on refund without payment mode.
+
+        When a partner has a bank account with allow_out_payment=True but no
+        payment mode is configured, the reversal wizard should still auto-select
+        the trusted bank account via core _compute_partner_bank_id.
+        """
+        self.env.company.keep_partner_bank_without_payment_mode = True
+        partner_no_mode = (
+            self.env["res.partner"]
+            .with_company(self.company.id)
+            .create({"name": "Partner without payment mode"})
+        )
+        trusted_bank = self.env["res.partner.bank"].create(
+            {
+                "acc_number": "BE32121212121212",
+                "partner_id": partner_no_mode.id,
+                "allow_out_payment": True,
+            }
+        )
+        invoice = self._create_invoice(
+            default_move_type="out_invoice", partner=partner_no_mode
+        )
+        invoice.payment_mode_id = False
+        invoice.action_post()
+
+        refund_wizard = (
+            self.env["account.move.reversal"]
+            .with_context(
+                active_ids=[invoice.id],
+                active_id=invoice.id,
+                active_model="account.move",
+            )
+            .create(
+                {
+                    "reason": "test refund without payment mode",
+                    "journal_id": invoice.journal_id.id,
+                }
+            )
+        )
+        refund_move = self.move_model.browse(refund_wizard.reverse_moves()["res_id"])
+        self.assertEqual(refund_move.partner_bank_id, trusted_bank)
 
     def test_print_report(self):
         self.supplier_invoice.partner_bank_id = self.supplier_bank.id
